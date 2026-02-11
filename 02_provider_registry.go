@@ -47,6 +47,12 @@ type SecretClient interface {
 // =============================================================================
 // A simple map protected by a mutex. Providers register themselves here.
 //
+// Why a global variable? Because init() functions run before main(), so there's
+// no opportunity to pass a registry via dependency injection. The global map is
+// the standard Go pattern for self-registering plugins (used by database/sql,
+// image/png, etc.). The mutex is needed because init() execution order across
+// packages is not guaranteed by the Go spec.
+//
 // Real code: apis/externalsecrets/v1/provider_schema.go:26-50
 
 var (
@@ -55,7 +61,10 @@ var (
 )
 
 // Register adds a provider to the global registry.
-// Panics if a provider with the same name already exists (catches bugs early).
+// Panics if a provider with the same name already exists — this is intentional.
+// A duplicate registration means two packages are claiming the same provider name,
+// which is always a bug. Panicking at startup (during init()) is preferable to
+// silently overwriting a provider at runtime, which would be extremely hard to debug.
 //
 // Real code: apis/externalsecrets/v1/provider_schema.go:35-50
 func RegisterProvider(name string, provider SecretProvider) {
@@ -81,6 +90,11 @@ func GetProviderByName(name string) (SecretProvider, bool) {
 
 // GetProviderFromSpec determines which provider to use based on the store spec.
 // It marshals the spec to JSON and finds the one non-nil field.
+//
+// This is an elegant approach to polymorphic dispatch: the SecretStore spec is a
+// Go struct with one field per provider (AWS, Vault, GCP, etc.), and exactly one
+// must be non-nil. By marshaling to JSON and inspecting the keys, the code avoids
+// a giant switch/case and automatically supports any new provider that's registered.
 //
 // For example: {"aws": {"region": "us-east-1"}} → provider name is "aws"
 //
@@ -153,6 +167,13 @@ func (c *VaultClient) GetSecretMap(key string) (map[string][]byte, error) {
 // =============================================================================
 // Each provider file registers itself when imported.
 // Build tags control which files are compiled.
+//
+// The init() + build tag combination is powerful:
+//   - init() runs automatically when a package is imported — no manual wiring needed
+//   - Build tags (//go:build aws || all_providers) let you compile only the
+//     providers you need, reducing binary size and attack surface
+//   - For example, `go build -tags=aws,vault` produces a binary with only
+//     AWS and Vault support; `go build -tags=all_providers` includes everything
 //
 // Real file: pkg/register/aws.go
 //   //go:build aws || all_providers

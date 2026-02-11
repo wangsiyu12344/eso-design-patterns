@@ -35,12 +35,22 @@ import (
 
 // SecretsProvider creates authenticated clients.
 // Corresponds to the Provider interface in the real code.
+//
+// Note the two-phase design: Provider creates a Client, Client fetches secrets.
+// This separation exists because authentication (NewClient) is expensive and
+// can be reused across multiple GetSecret calls. The reconciler creates ONE
+// client per reconciliation, then makes multiple calls to fetch different keys.
 type SecretsProvider interface {
 	NewClient(ctx context.Context, store StoreConfig) (SecretsClient, error)
 }
 
 // SecretsClient fetches secrets from the external provider.
 // Corresponds to the client interface each provider returns.
+//
+// GetSecret returns a single value; GetSecretMap returns a key-value map.
+// The distinction matters because some providers store structured data
+// (e.g., a JSON object with multiple fields), while others store flat values.
+// Close() is called via defer to release any resources (connections, tokens, etc.).
 type SecretsClient interface {
 	GetSecret(ctx context.Context, key string) ([]byte, error)
 	GetSecretMap(ctx context.Context, key string) (map[string][]byte, error)

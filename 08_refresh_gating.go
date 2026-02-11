@@ -53,11 +53,18 @@ type SecretState struct {
 // shouldRefresh determines if we need to call the external provider.
 //
 // Real code: externalsecret_controller.go:1103-1149
+// shouldRefresh is the first of two gating checks. It examines the ExternalSecret's
+// refresh policy and generation to decide whether a provider call is needed.
+// The `currentGeneration` is Kubernetes' built-in counter that increments every time
+// the .spec is modified — it's free metadata that lets us detect spec changes without
+// deep-comparing the entire spec.
 func shouldRefresh(spec ExternalSecretSpec, status ExternalSecretStatus, currentGeneration int64) bool {
 	switch spec.RefreshPolicy {
 
 	// "CreatedOnce" — only fetch once, ever.
-	// Useful for secrets that never change (e.g., static API keys).
+	// Useful for secrets that never change (e.g., static API keys, certificates
+	// with long lifetimes). After the first successful sync, this ExternalSecret
+	// will never call the provider again, even if the refresh interval elapses.
 	case "CreatedOnce":
 		if status.SyncedResourceVersion == "" || status.RefreshTime.IsZero() {
 			return true // never synced before
@@ -65,7 +72,9 @@ func shouldRefresh(spec ExternalSecretSpec, status ExternalSecretStatus, current
 		return false // already synced, never refresh again
 
 	// "OnChange" — only fetch when the ExternalSecret spec changes.
-	// Useful when you want manual control over refreshes.
+	// Useful when you want manual control over refreshes: the secret is only
+	// re-fetched when someone edits the ExternalSecret (which bumps the generation).
+	// This is great for secrets that you want to pin to a specific version.
 	case "OnChange":
 		if status.SyncedResourceVersion == "" || status.RefreshTime.IsZero() {
 			return true // never synced before
@@ -101,7 +110,12 @@ func shouldRefreshPeriodic(spec ExternalSecretSpec, status ExternalSecretStatus,
 	return time.Since(status.RefreshTime) >= spec.RefreshInterval
 }
 
-// isSecretValid checks if the existing K8s Secret is in the expected state.
+// isSecretValid is the second gating check. Even if shouldRefresh says "no refresh
+// needed," the reconciler still verifies that the target K8s Secret hasn't been
+// tampered with or deleted. This covers scenarios like:
+//   - Someone ran "kubectl delete secret my-secret" manually
+//   - Someone edited the secret's data directly (the data hash won't match)
+//   - The secret was created by a different process and lacks the "managed" label
 //
 // Real code: externalsecret_controller.go:1152-1174
 func isSecretValidCheck(secret SecretState, expectedDataHash string) bool {

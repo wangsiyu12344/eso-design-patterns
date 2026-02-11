@@ -54,9 +54,19 @@ type ExternalSecret struct {
 //       return nil
 //   }
 
+// buildMutationFunc returns a closure that transforms any Secret (new or existing)
+// to match the desired state. The closure captures `es` and `providerData` from the
+// enclosing scope, so the caller doesn't need to thread them through every function.
+//
+// This is a textbook use of closures: the mutation logic is defined once but executed
+// in two different contexts (create vs update). The closure "remembers" what the
+// secret should look like, regardless of when or where it's called.
 func buildMutationFunc(es *ExternalSecret, providerData map[string][]byte) func(*Secret) error {
 	return func(secret *Secret) error {
-		// Initialize maps (safe to set values)
+		// Initialize maps to avoid nil pointer panics when setting values.
+		// This is defensive coding — the secret might be brand new (create path)
+		// with nil maps, or it might be an existing secret (update path) that
+		// already has maps populated.
 		// Real code: externalsecret_controller.go:480-488
 		if secret.Labels == nil {
 			secret.Labels = make(map[string]string)
@@ -81,7 +91,13 @@ func buildMutationFunc(es *ExternalSecret, providerData map[string][]byte) func(
 			secret.Data[k] = v
 		}
 
-		// Set tracking labels
+		// Set tracking labels used by other patterns:
+		//   - "managed" label: used by the layered cache (Pattern 09) to filter
+		//     which secrets are cached, and by refresh gating (Pattern 08) to
+		//     verify the secret was created by this controller.
+		//   - "data-hash" annotation: used by refresh gating (Pattern 08) to
+		//     detect tampering — if someone manually edits the secret, the hash
+		//     won't match and the reconciler will re-sync from the provider.
 		// Real code: externalsecret_controller.go:529-530
 		secret.Labels["reconcile.external-secrets.io/managed"] = "true"
 		secret.Annotations["reconcile.external-secrets.io/data-hash"] = "abc123"

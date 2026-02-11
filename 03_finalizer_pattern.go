@@ -25,6 +25,10 @@ import (
 	"fmt"
 )
 
+// Finalizer names must be globally unique to avoid collisions with other controllers.
+// By convention, they use a DNS-like prefix followed by a descriptive suffix.
+// This ensures that if multiple controllers manage the same object, each one's
+// finalizer is distinct and independently managed.
 const MyFinalizer = "mycontroller.example.com/cleanup"
 
 // Real finalizer name:
@@ -41,7 +45,7 @@ type Resource struct {
 
 type ResourceSpec struct {
 	TargetSecretName string
-	DeletionPolicy   string // "Delete", "Retain"
+	DeletionPolicy   string // "Delete" = remove managed secret on cleanup; "Retain" = leave it
 }
 
 type FinalizerReconciler struct {
@@ -76,9 +80,15 @@ func (r *FinalizerReconciler) Reconcile(ctx context.Context, name, namespace str
 	//       return ctrl.Result{}, nil
 	//   }
 	if resource.DeletionTimestamp != nil {
-		// Object is being deleted. Run cleanup.
+		// Object is being deleted — Kubernetes has set DeletionTimestamp but is
+		// waiting for all finalizers to be removed before actually deleting from etcd.
+		// This is our window to perform cleanup. If cleanup fails, we return an error
+		// and the finalizer stays — the object remains in a "terminating" state until
+		// we successfully clean up and remove the finalizer.
 		if hasFinalizer(resource, MyFinalizer) {
-			// Clean up managed resources based on deletion policy
+			// Clean up managed resources based on deletion policy.
+			// The DeletionPolicy gives users control: "Delete" cleans up the managed
+			// K8s Secret (default), while "Retain" leaves it in place for manual handling.
 			if resource.Spec.DeletionPolicy == "Delete" {
 				fmt.Println("deleting managed secret:", resource.Spec.TargetSecretName)
 				if err := r.client.DeleteSecret(ctx, resource.Spec.TargetSecretName, namespace); err != nil {
@@ -88,7 +98,9 @@ func (r *FinalizerReconciler) Reconcile(ctx context.Context, name, namespace str
 				fmt.Println("retaining managed secret:", resource.Spec.TargetSecretName)
 			}
 
-			// Remove our finalizer — this allows Kubernetes to proceed with deletion
+			// Remove our finalizer — this is the critical step that unblocks deletion.
+			// Once we remove it, Kubernetes checks if any other finalizers remain.
+			// If not, the object is permanently deleted from etcd.
 			removeFinalizer(resource, MyFinalizer)
 			if err := r.client.Update(ctx, resource); err != nil {
 				return err
@@ -100,6 +112,10 @@ func (r *FinalizerReconciler) Reconcile(ctx context.Context, name, namespace str
 	// =========================================================================
 	// Step 1: Normal reconcile — ensure finalizer exists
 	// =========================================================================
+	// We add the finalizer early (ideally on first reconcile after creation)
+	// so that if the user deletes the object later, we're guaranteed a chance
+	// to run cleanup. Without the finalizer, a "kubectl delete" would immediately
+	// remove the object from etcd, and our cleanup logic would never execute.
 	// Real code: externalsecret_controller.go:229-234
 	//
 	//   patch := client.MergeFrom(externalSecret.DeepCopy())

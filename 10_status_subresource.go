@@ -33,6 +33,15 @@ import (
 //   - The controller updates .status (not the user)
 //   - The user updates .spec (not the controller)
 //   - They use different API endpoints, avoiding conflicts
+//
+// This separation is fundamental to the Kubernetes control loop model:
+// .spec is the DESIRED state (set by the user), .status is the OBSERVED state
+// (set by the controller). The reconciler's job is to make .status converge
+// toward .spec, and then report the result back via .status.conditions.
+//
+// Using separate API endpoints also means a user updating .spec and the
+// controller updating .status won't cause optimistic concurrency conflicts,
+// which would otherwise be a constant problem in a busy cluster.
 
 type ESStatus struct {
 	// Conditions follow the standard Kubernetes condition pattern
@@ -48,12 +57,15 @@ type ESStatus struct {
 	Binding string // e.g., "my-secret"
 }
 
+// Condition follows the standard Kubernetes condition convention (KEP-1623).
+// Every controller uses the same structure, making it easy for monitoring tools
+// (Prometheus, Grafana, kubectl) to work across different custom resources.
 type Condition struct {
-	Type               string    // "Ready"
-	Status             string    // "True", "False"
-	Reason             string    // "SecretSynced", "SecretSyncedError"
-	Message            string    // human-readable description
-	LastTransitionTime time.Time // when the condition last changed
+	Type               string    // "Ready" — the condition type; most CRDs use "Ready" as the primary health signal
+	Status             string    // "True", "False", or "Unknown" — three-valued logic, not just boolean
+	Reason             string    // machine-readable reason (e.g., "SecretSynced") — used for programmatic checks
+	Message            string    // human-readable description — shown to users in kubectl output
+	LastTransitionTime time.Time // when Status last changed — useful for alerting on "stuck" conditions
 }
 
 // =============================================================================
@@ -84,10 +96,16 @@ type StatusReconciler struct{}
 func (r *StatusReconciler) Reconcile(ctx context.Context, name, namespace string) (err error) {
 	status := &ESStatus{}
 
-	// Snapshot the current status BEFORE any changes
+	// Snapshot the current status BEFORE any changes.
+	// We deep-copy here so we can compare "before" vs "after" at the end.
+	// If nothing changed, we skip the status update API call entirely.
 	originalStatus := *status
 
-	// Deferred function: updates status when Reconcile() returns
+	// Deferred function: updates status when Reconcile() returns.
+	// Using defer guarantees this runs on EVERY exit path — success, error,
+	// early return, or even panic recovery. This eliminates an entire class
+	// of bugs where a developer adds a new return statement and forgets to
+	// update the status.
 	defer func() {
 		// Only update if something changed (avoids unnecessary API calls)
 		if statusEqual(originalStatus, *status) {

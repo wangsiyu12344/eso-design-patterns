@@ -47,6 +47,11 @@ import (
 // This works because of level-triggered reconciliation (Pattern 1):
 // Reconcile() always reads the LATEST state, so it doesn't matter which
 // event triggered it. The most recent state is always used.
+//
+// The deduplication is key to making level-triggered reconciliation efficient.
+// Without it, a burst of updates to the same object would cause redundant work.
+// With it, no matter how many events fire, only ONE reconcile runs, and it
+// always converges to the correct state because it reads the current truth.
 
 // =============================================================================
 // Result Handling After Reconcile()
@@ -77,8 +82,11 @@ func ExampleResultHandling() {
 	// Real code: externalsecret_controller.go:607
 	//   return r.getRequeueResult(externalSecret), nil
 	//
-	// The item is "forgotten" (removed from retry tracking).
-	// But it's requeued after the refresh interval (default 1 hour).
+	// The item is "forgotten" (removed from retry tracking), which resets its
+	// exponential backoff counter. It's then requeued after the refresh interval
+	// (e.g. 1 hour). The distinction between Forget+RequeueAfter vs just Requeue
+	// is important: Forget clears the failure count, so the next failure starts
+	// backoff from scratch rather than continuing from a high delay.
 	_ = ReconcileResult{RequeueAfter: 1 * time.Hour}
 	fmt.Println("Success → requeue after 1 hour for periodic refresh")
 
@@ -92,6 +100,11 @@ func ExampleResultHandling() {
 	//   Attempt 3: retry after ~20ms
 	//   ...
 	//   Attempt N: retry after ~max (usually 1000s)
+	//
+	// The backoff prevents "thundering herd" problems: if an external provider
+	// goes down, all ExternalSecrets targeting it would fail and retry. Without
+	// backoff, they'd all hammer the provider simultaneously as soon as it comes
+	// back up, potentially causing it to fail again.
 	fmt.Println("Error → requeue with exponential backoff")
 
 	// CASE 3: Permanent error — configuration issue, can't be fixed by retrying
@@ -100,6 +113,11 @@ func ExampleResultHandling() {
 	//
 	// The item is forgotten. No retry. The status is updated to show the error.
 	// A new Reconcile() will only happen if the resource is modified.
+	//
+	// Notice the subtle trick: returning nil as the error tells the workqueue
+	// "this succeeded" even though the reconciliation logically failed. The
+	// controller uses status conditions (Pattern 10) to communicate the error
+	// to users. This avoids wasting CPU on retries that can never succeed.
 	_ = ReconcileResult{}
 	fmt.Println("Permanent error → don't retry, wait for user to fix config")
 
@@ -131,6 +149,12 @@ func ExampleResultHandling() {
 //   3. Handle result (forget, requeue, backoff)
 //   4. queue.Done(item) — marks item as processed (allows re-enqueue)
 //   5. Go back to step 1
+//
+// The queue.Done() call is critical: while an item is being processed (between
+// Get and Done), the queue prevents other workers from picking up the same key.
+// However, if a new event for the same key arrives during processing, the queue
+// remembers it and re-enqueues the key after Done() is called. This guarantees
+// that the latest state will always be reconciled, without concurrent access.
 
 func ExampleWorkerLoop() {
 	// With --concurrent=5, there are 5 worker goroutines.

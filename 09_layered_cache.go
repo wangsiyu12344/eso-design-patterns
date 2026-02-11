@@ -30,6 +30,13 @@ import "fmt"
 // metadata (name, namespace, labels, annotations, resourceVersion) — NOT the
 // full secret data. This dramatically reduces memory usage.
 //
+// Why watch secrets at all? Because the reconciler needs to detect when a managed
+// secret is externally modified or deleted. Without watching, the reconciler would
+// only learn about secret changes at the next refresh interval (up to hours later).
+// By watching metadata only, the controller stays responsive while keeping memory
+// usage minimal — a typical PartialObjectMetadata is ~500 bytes vs potentially
+// tens of KB for a full Secret with large data payloads.
+//
 // Real code: externalsecret_controller.go:1230-1234
 //
 //   WatchesMetadata(
@@ -151,6 +158,12 @@ func ExampleDualCacheRead() {
 	fullSecretRV := "12345"
 
 	// Step 3: Cross-check — ensure caches are in sync
+	// This is a subtle but important consistency check. Because the partial cache
+	// and the managed/full cache are separate informers with independent watch
+	// streams, they can temporarily disagree (e.g., after a secret update, one
+	// cache might see the new version while the other still has the old one).
+	// By comparing UID and ResourceVersion, the reconciler detects this drift
+	// and retries with backoff, giving the slower cache time to catch up.
 	// Real code: externalsecret_controller.go:339-344
 	//
 	//   if secretPartial.UID != existingSecret.UID || secretPartial.ResourceVersion != existingSecret.ResourceVersion {

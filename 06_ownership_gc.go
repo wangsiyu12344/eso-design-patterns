@@ -54,10 +54,17 @@ type OwnerReference struct {
 	APIVersion         string
 	Kind               string
 	Name               string
-	UID                string
-	Controller         bool // true = this is the controller owner (only one allowed)
-	BlockOwnerDeletion bool
+	UID                string // The UID ensures we reference the exact object, not just a name match
+	Controller         bool   // true = this is the controller owner (only one allowed per object)
+	BlockOwnerDeletion bool   // true = block owner deletion until this child is cleaned up
 }
+
+// Why Controller=true is important:
+// Kubernetes allows multiple ownerReferences (an object can have multiple "parents"),
+// but only ONE can be the "controller" owner. This prevents conflicts: if two
+// ExternalSecrets both targeted the same Secret with Controller=true, the second
+// SetControllerReference call would fail, surfacing the conflict immediately
+// rather than allowing a silent update war.
 
 // =============================================================================
 // Layer 2: Label-Based Ownership (for orphan detection)
@@ -66,7 +73,9 @@ type OwnerReference struct {
 // Problem: If the user changes spec.target.name from "secret-a" to "secret-b",
 // the controller creates "secret-b" but "secret-a" is now orphaned.
 // OwnerReferences don't help here because the OLD secret still has a valid
-// ownerReference pointing to the ExternalSecret.
+// ownerReference pointing to the ExternalSecret — Kubernetes won't GC it
+// since the owner (ExternalSecret) still exists. The ownerRef only triggers
+// deletion when the OWNER is deleted, not when the owner stops "wanting" the child.
 //
 // Solution: A label that hashes the ExternalSecret's name, allowing the controller
 // to find all secrets owned by a specific ExternalSecret and delete orphans.
