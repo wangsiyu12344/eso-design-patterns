@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // =============================================================================
@@ -139,6 +140,105 @@ func ReconcileWithTryLock(providerName, secretName string) error {
 	return nil
 }
 
+// =============================================================================
+// Retry Logic: How the Workqueue Handles TryLock Failures
+// =============================================================================
+//
+// In a real Kubernetes controller, the workqueue automatically retries on error.
+// But here we show the explicit retry logic to make the pattern clear.
+// This is what controller-runtime's workqueue does under the hood.
+
+// ReconcileWithRetry wraps ReconcileWithTryLock with explicit retry logic.
+// In a real controller, you DON'T need to write this — the workqueue does it
+// for you. This is here to illustrate what happens when TryLock fails.
+func ReconcileWithRetry(providerName, secretName string, maxRetries int) error {
+	backoff := NewRetryBackoff(100*time.Millisecond, 10*time.Second, 2.0)
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err := ReconcileWithTryLock(providerName, secretName)
+		if err == nil {
+			return nil // success
+		}
+
+		// Distinguish "locked by another goroutine" from real errors.
+		// Only retry on ErrConflict — other errors should surface immediately.
+		if !errors.Is(err, ErrConflict) {
+			return err // real error, don't retry
+		}
+
+		// Wait with exponential backoff before retrying.
+		// In a real controller, you DON'T call time.Sleep — the workqueue's
+		// rate limiter handles this. The goroutine goes back to processing
+		// other items, and the item is re-enqueued after the delay.
+		//
+		// We use time.Sleep here only for illustration purposes.
+		delay := backoff.NextDelay()
+		fmt.Printf("attempt %d: lock conflict for %s/%s, retrying in %v\n",
+			attempt+1, providerName, secretName, delay)
+		time.Sleep(delay)
+		lastErr = err
+	}
+	return fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+}
+
+// =============================================================================
+// Exponential Backoff Implementation
+// =============================================================================
+//
+// This mirrors what controller-runtime's workqueue.DefaultItemBasedRateLimiter
+// does internally (client-go/util/workqueue/default_rate_limiters.go).
+//
+// The formula: delay = base * (factor ^ attempt), capped at maxDelay
+//
+// Example with base=100ms, factor=2, max=10s:
+//   Attempt 0: 100ms
+//   Attempt 1: 200ms
+//   Attempt 2: 400ms
+//   Attempt 3: 800ms
+//   Attempt 4: 1.6s
+//   Attempt 5: 3.2s
+//   Attempt 6: 6.4s
+//   Attempt 7: 10s  ← capped at maxDelay
+//   Attempt 8: 10s  ← stays at max
+
+type RetryBackoff struct {
+	base     time.Duration // initial delay (e.g., 100ms)
+	maxDelay time.Duration // upper bound (e.g., 10s)
+	factor   float64       // multiplier per attempt (e.g., 2.0)
+	current  time.Duration // current delay
+}
+
+func NewRetryBackoff(base, maxDelay time.Duration, factor float64) *RetryBackoff {
+	return &RetryBackoff{
+		base:     base,
+		maxDelay: maxDelay,
+		factor:   factor,
+		current:  base,
+	}
+}
+
+func (b *RetryBackoff) NextDelay() time.Duration {
+	delay := b.current
+
+	// Increase for next attempt: current = current * factor
+	b.current = time.Duration(float64(b.current) * b.factor)
+
+	// Cap at maxDelay to prevent unbounded growth
+	if b.current > b.maxDelay {
+		b.current = b.maxDelay
+	}
+
+	return delay
+}
+
+// Reset resets the backoff to its initial state.
+// In a real controller, this is called when the item succeeds:
+//   queue.Forget(key)  ← resets the rate limiter for this key
+func (b *RetryBackoff) Reset() {
+	b.current = b.base
+}
+
 // KEY INSIGHT:
 // The combination of sync.Map + TryLock + workqueue retry gives you:
 //   - Per-key granularity (different secrets can be updated in parallel)
@@ -146,7 +246,17 @@ func ReconcileWithTryLock(providerName, secretName string) error {
 //   - Automatic retry (workqueue handles it)
 //   - No deadlocks (TryLock can't deadlock by definition)
 //   - No memory leaks (sync.Map entries are small and bounded by # of secrets)
+//
+// The retry flow in a Kubernetes controller:
+//   1. Reconcile() called → TryLock fails → return ErrConflict
+//   2. controller-runtime sees error → calls queue.AddRateLimited(key)
+//   3. Rate limiter waits (exponential backoff: 5ms, 10ms, 20ms, ...)
+//   4. Item re-queued → Reconcile() called again → TryLock succeeds
+//   5. Do work → unlock → queue.Forget(key) (reset backoff)
+//
+// The goroutine is NEVER idle — between retries it processes other items.
 
 func init() {
 	_ = ReconcileWithTryLock
+	_ = ReconcileWithRetry
 }

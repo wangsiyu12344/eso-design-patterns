@@ -188,13 +188,76 @@ func createCloudCredential(ctx context.Context) (*Credential, error) {
 	return &Credential{ID: "cred-123"}, nil
 }
 func deleteCloudCredential(ctx context.Context, c *Credential) error {
-	fmt.Printf("deleting credential %s\n", c.ID)
+	// IMPORTANT: Rollback functions MUST be idempotent.
+	// If the credential doesn't exist (already deleted, or creation partially failed),
+	// treat it as success — not an error.
+	// In real code: call cloud API delete, and ignore "NotFound" / "404" errors.
+	//   err := cloudClient.DeleteCredential(c.ID)
+	//   if err != nil && !isNotFound(err) {
+	//       return err
+	//   }
+	fmt.Printf("deleting credential %s (no-op if not found)\n", c.ID)
 	return nil
 }
-func storeState(ctx context.Context, c *Credential) error       { return nil }
-func updateReferences(ctx context.Context, c *Credential) error  { return nil }
-func removeReferences(ctx context.Context, c *Credential) error  { return nil }
-func validateFinalState(ctx context.Context, c *Credential) error { return nil }
+func storeState(ctx context.Context, c *Credential) error { return nil }
+func updateReferences(ctx context.Context, c *Credential) error { return nil }
+func removeReferences(ctx context.Context, c *Credential) error {
+	// IMPORTANT: Idempotent — if references were never created
+	// (because Commit never ran), this is a no-op, not an error.
+	//   err := k8sClient.Delete(ctx, ref)
+	//   if apierrors.IsNotFound(err) {
+	//       return nil  // already gone or never existed — that's fine
+	//   }
+	fmt.Printf("removing references for %s (no-op if not found)\n", c.ID)
+	return nil
+}
+func validateFinalState(ctx context.Context, c *Credential) error {
+	// PURPOSE: Verify the preconditions that Commit() depends on.
+	// Each check here maps to a Commit operation that would fail or produce
+	// invalid state if the precondition isn't met.
+	//
+	// Commit operation              → What we validate here
+	// ──────────────────────────────────────────────────────────────
+	// storeState(ctx, cred)         → credential is active and usable
+	//                                 (no point persisting a dead credential)
+	// updateReferences(ctx, cred)   → credential has correct permissions
+	//                                 (references to a broken cred = broken secrets)
+	//
+	// If validation fails → Rollback (clean up the credential we created)
+	// If validation passes → Commit (safe to persist state + update references)
+
+	// 1. Precondition for storeState: credential must be active
+	//    If the cloud provider hasn't finished provisioning it yet,
+	//    committing would persist a reference to a non-functional credential.
+	if err := verifyCredentialActive(ctx, c); err != nil {
+		return fmt.Errorf("credential %s not active: %w", c.ID, err)
+	}
+
+	// 2. Precondition for updateReferences: credential must actually work
+	//    If we can't auth with it, updating references would point
+	//    ExternalSecrets at a credential that can't fetch anything.
+	if err := testCredentialAccess(ctx, c); err != nil {
+		return fmt.Errorf("credential %s access test failed: %w", c.ID, err)
+	}
+
+	return nil
+}
+
+func verifyCredentialActive(ctx context.Context, c *Credential) error {
+	// In real code: call cloud provider API to check credential status
+	// e.g., AWS IAM GetAccessKeyLastUsed, GCP ServiceAccountKey get
+	// Returns error if credential is in "Inactive" or "Creating" state
+	fmt.Printf("verifying credential %s is active\n", c.ID)
+	return nil
+}
+
+func testCredentialAccess(ctx context.Context, c *Credential) error {
+	// In real code: attempt a lightweight operation using the credential
+	// e.g., STS GetCallerIdentity for AWS, or a token introspection for GCP
+	// This ensures the credential actually works before we commit it into state
+	fmt.Printf("testing access with credential %s\n", c.ID)
+	return nil
+}
 
 func init() {
 	_ = generateWithoutRollback

@@ -77,6 +77,9 @@ func SetCondition(status *ResourceStatus, newCond Condition, resourceName string
 	// This preserves the answer to "since when has this been in this state?"
 	if currentCond != nil && currentCond.Status == newCond.Status {
 		newCond.LastTransitionTime = currentCond.LastTransitionTime
+	} else {
+		// Status actually changed (or new condition) → record transition time
+		newCond.LastTransitionTime = time.Now()
 	}
 
 	// Replace old condition with new one

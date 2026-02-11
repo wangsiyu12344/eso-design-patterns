@@ -24,6 +24,7 @@ package eso_advanced_patterns
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -33,7 +34,7 @@ import (
 //
 // Every time a provider needs a new flag, you modify the main package.
 // This creates merge conflicts, tight coupling, and a file that grows endlessly.
-
+//
 // In main.go:
 //   var gcGracePeriod time.Duration
 //   var awsRegion string
@@ -57,82 +58,157 @@ import (
 // Feature contains CLI flags that a subsystem exposes, plus an optional
 // initialization function called after flags are parsed.
 type Feature struct {
+	Name       string
 	Flags      *FlagSet
 	Initialize func() // called after flag parsing, optional
 }
 
-// Global registry — populated by init() functions across packages.
-var features = make([]Feature, 0)
-
-// Register adds a feature's flags to the global registry.
-// Called from init() functions in each subsystem.
-func Register(f Feature) {
-	features = append(features, f)
+// FeatureRegistry collects features from all subsystems.
+// In real code this is a package-level var in runtime/feature/feature.go.
+type FeatureRegistry struct {
+	features []Feature
 }
 
-// Features returns all registered features.
-func Features() []Feature {
-	return features
+func NewFeatureRegistry() *FeatureRegistry {
+	return &FeatureRegistry{}
+}
+
+// Register adds a feature's flags to the registry.
+// Called from init() functions in each subsystem package.
+func (r *FeatureRegistry) Register(f Feature) {
+	r.features = append(r.features, f)
 }
 
 // =============================================================================
-// How Subsystems Register Flags
+// Subsystem 1: State Manager (GC flags)
 // =============================================================================
 //
-// Each subsystem defines its flags in its own package and registers them
-// via init(). No changes to main.go required.
+// In real code, this lives in runtime/statemanager/statemanager.go.
+// The subsystem defines its own config and registers its own flags.
+// Nobody outside this file needs to know these flags exist.
 
-// --- In runtime/statemanager/statemanager.go ---
+type StateManagerConfig struct {
+	GCGracePeriod   time.Duration
+	GCCheckInterval time.Duration
+}
 
-var gcGracePeriod time.Duration
+// RegisterStateManagerFlags is called from init() in the statemanager package.
+// It registers GC-related flags and an Initialize function for validation.
+func RegisterStateManagerFlags(registry *FeatureRegistry) *StateManagerConfig {
+	cfg := &StateManagerConfig{}
+	fs := NewFlagSet("statemanager")
 
-func init() {
-	fs := NewFlagSet("gc")
-	fs.DurationVar(&gcGracePeriod, "generator-gc-grace-period", 2*time.Minute,
+	// Define flags — these will appear in --help automatically
+	fs.DurationVar(&cfg.GCGracePeriod, "generator-gc-grace-period", 2*time.Minute,
 		"grace period before garbage collecting generator state")
-	Register(Feature{Flags: fs})
+	fs.DurationVar(&cfg.GCCheckInterval, "generator-gc-check-interval", 30*time.Second,
+		"how often to check for expired generator state")
+
+	registry.Register(Feature{
+		Name:  "statemanager",
+		Flags: fs,
+		Initialize: func() {
+			// Called AFTER flags are parsed — do validation here.
+			// This keeps validation logic next to the flag definition,
+			// not scattered in main.go.
+			if cfg.GCGracePeriod < 30*time.Second {
+				fmt.Println("WARNING: gc-grace-period too low, clamping to 30s")
+				cfg.GCGracePeriod = 30 * time.Second
+			}
+			fmt.Printf("  [statemanager] initialized: gc-grace=%v, gc-interval=%v\n",
+				cfg.GCGracePeriod, cfg.GCCheckInterval)
+		},
+	})
+
+	return cfg
 }
 
-// --- In providers/aws/flags.go (hypothetical) ---
-
-var awsMaxRetries int
-
-// func init() {
-//     fs := NewFlagSet("aws")
-//     fs.IntVar(&awsMaxRetries, "aws-max-retries", 3, "max retries for AWS API calls")
-//     Register(Feature{
-//         Flags: fs,
-//         Initialize: func() {
-//             // Called after flags are parsed — can do validation or setup
-//             if awsMaxRetries < 0 {
-//                 awsMaxRetries = 3
-//             }
-//         },
-//     })
-// }
-
 // =============================================================================
-// How main.go Collects and Applies Flags
+// Subsystem 2: AWS Provider (retry flags)
 // =============================================================================
 //
-// The main package iterates over all registered features, adds their flags
-// to the root command, and calls Initialize after parsing.
+// Hypothetical: providers/aws/flags.go
+// Adding a new flag here requires ZERO changes to main.go.
 
-func setupFlags() {
-	// Collect all flags from registered features
-	for _, f := range Features() {
-		// In real code: rootCmd.Flags().AddFlagSet(f.Flags.pflagSet)
-		fmt.Printf("Adding flags from: %s\n", f.Flags.name)
+type AWSProviderConfig struct {
+	MaxRetries int
+	Region     string
+}
+
+func RegisterAWSProviderFlags(registry *FeatureRegistry) *AWSProviderConfig {
+	cfg := &AWSProviderConfig{}
+	fs := NewFlagSet("aws")
+
+	fs.IntVar(&cfg.MaxRetries, "aws-max-retries", 3,
+		"max retries for AWS API calls")
+	fs.StringVar(&cfg.Region, "aws-region", "us-east-1",
+		"default AWS region")
+
+	registry.Register(Feature{
+		Name:  "aws",
+		Flags: fs,
+		Initialize: func() {
+			if cfg.MaxRetries < 0 {
+				cfg.MaxRetries = 3
+			}
+			fmt.Printf("  [aws] initialized: region=%s, max-retries=%d\n",
+				cfg.Region, cfg.MaxRetries)
+		},
+	})
+
+	return cfg
+}
+
+// =============================================================================
+// main.go: Collect and Apply All Flags
+// =============================================================================
+//
+// The main package doesn't know which subsystems exist. It just iterates
+// over whatever was registered.
+//
+// Real code flow:
+//   1. Go init() functions run → each subsystem calls Register()
+//   2. main() creates root cobra command
+//   3. Loop over Features() → rootCmd.Flags().AddFlagSet(f.Flags)
+//   4. rootCmd.Execute() parses flags
+//   5. Loop over Features() → call Initialize()
+
+func demonstrateFeatureFlags() {
+	registry := NewFeatureRegistry()
+
+	// --- Phase 1: Registration (happens in init() functions) ---
+	// In real code, these are called by Go's init() mechanism.
+	// Each subsystem registers independently — no coordination needed.
+	fmt.Println("Phase 1: Registration")
+	smCfg := RegisterStateManagerFlags(registry)
+	awsCfg := RegisterAWSProviderFlags(registry)
+
+	// --- Phase 2: Collect flags for CLI (happens in main()) ---
+	// In real code: rootCmd.Flags().AddFlagSet(f.Flags.pflagSet)
+	fmt.Println("\nPhase 2: Collect flags for --help")
+	for _, f := range registry.features {
+		fmt.Printf("  registered flags from [%s]: %s\n", f.Name, f.Flags.FlagNames())
 	}
 
-	// Parse flags (handled by cobra/pflag in real code)
+	// --- Phase 3: Parse flags (cobra/pflag handles this) ---
+	// Simulate user passing: --generator-gc-grace-period=5m --aws-region=eu-west-1
+	fmt.Println("\nPhase 3: Parse CLI args (simulated)")
+	simulateFlagParsing(registry, map[string]string{
+		"generator-gc-grace-period": "5m",
+		"aws-region":                "eu-west-1",
+	})
 
-	// Call Initialize functions
-	for _, f := range Features() {
+	// --- Phase 4: Initialize (post-parse validation and setup) ---
+	fmt.Println("\nPhase 4: Initialize subsystems")
+	for _, f := range registry.features {
 		if f.Initialize != nil {
 			f.Initialize()
 		}
 	}
+
+	// --- Result: each subsystem's config is ready to use ---
+	fmt.Printf("\nResult: statemanager gc-grace=%v\n", smCfg.GCGracePeriod)
+	fmt.Printf("Result: aws region=%s, retries=%d\n", awsCfg.Region, awsCfg.MaxRetries)
 }
 
 // =============================================================================
@@ -154,27 +230,90 @@ func setupFlags() {
 // 5. TESTABLE: Each subsystem can test its own flag defaults and validation
 //    without spinning up the entire operator.
 
-// --- Simplified FlagSet for illustration ---
+// --- FlagSet: simplified version of pflag.FlagSet ---
+
+type FlagEntry struct {
+	Name         string
+	DefaultValue string
+	Usage        string
+	pointer      interface{} // pointer to the variable to set
+}
 
 type FlagSet struct {
-	name  string
-	flags map[string]interface{}
+	name    string
+	entries []FlagEntry
 }
 
 func NewFlagSet(name string) *FlagSet {
-	return &FlagSet{name: name, flags: make(map[string]interface{})}
+	return &FlagSet{name: name}
 }
 
 func (fs *FlagSet) DurationVar(p *time.Duration, name string, value time.Duration, usage string) {
-	*p = value
-	fs.flags[name] = p
+	*p = value // set default
+	fs.entries = append(fs.entries, FlagEntry{
+		Name: name, DefaultValue: value.String(), Usage: usage, pointer: p,
+	})
 }
 
 func (fs *FlagSet) IntVar(p *int, name string, value int, usage string) {
-	*p = value
-	fs.flags[name] = p
+	*p = value // set default
+	fs.entries = append(fs.entries, FlagEntry{
+		Name: name, DefaultValue: fmt.Sprintf("%d", value), Usage: usage, pointer: p,
+	})
+}
+
+func (fs *FlagSet) StringVar(p *string, name string, value string, usage string) {
+	*p = value // set default
+	fs.entries = append(fs.entries, FlagEntry{
+		Name: name, DefaultValue: value, Usage: usage, pointer: p,
+	})
+}
+
+func (fs *FlagSet) FlagNames() string {
+	names := make([]string, len(fs.entries))
+	for i, e := range fs.entries {
+		names[i] = "--" + e.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// Set simulates parsing a flag value from CLI args.
+func (fs *FlagSet) Set(name, value string) bool {
+	for _, e := range fs.entries {
+		if e.Name != name {
+			continue
+		}
+		switch p := e.pointer.(type) {
+		case *time.Duration:
+			if d, err := time.ParseDuration(value); err == nil {
+				*p = d
+				return true
+			}
+		case *int:
+			var v int
+			if _, err := fmt.Sscanf(value, "%d", &v); err == nil {
+				*p = v
+				return true
+			}
+		case *string:
+			*p = value
+			return true
+		}
+	}
+	return false
+}
+
+// simulateFlagParsing simulates cobra/pflag parsing CLI arguments.
+func simulateFlagParsing(registry *FeatureRegistry, args map[string]string) {
+	for flagName, flagValue := range args {
+		for _, f := range registry.features {
+			if f.Flags.Set(flagName, flagValue) {
+				fmt.Printf("  --%s=%s → applied to [%s]\n", flagName, flagValue, f.Name)
+			}
+		}
+	}
 }
 
 func init() {
-	_ = setupFlags
+	_ = demonstrateFeatureFlags
 }
